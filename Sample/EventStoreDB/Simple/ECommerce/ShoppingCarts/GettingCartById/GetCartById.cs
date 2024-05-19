@@ -19,11 +19,9 @@ public record GetCartById(
         IQueryable<ShoppingCartDetails> shoppingCarts,
         GetCartById query,
         CancellationToken ct
-    )
-    {
-        return await shoppingCarts
+    ) =>
+        await shoppingCarts
             .SingleOrDefaultAsync(
                 x => x.Id == query.ShoppingCartId, ct
             ) ?? throw AggregateNotFoundException.For<ShoppingCartDetails>(query.ShoppingCartId);
-    }
 }
