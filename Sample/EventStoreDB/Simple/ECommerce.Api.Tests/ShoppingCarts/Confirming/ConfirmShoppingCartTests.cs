@@ -30,8 +30,7 @@ public class ConfirmShoppingCartTests(ConfirmShoppingCartFixture api): IClassFix
 {
     [Fact]
     [Trait("Category", "Acceptance")]
-    public async Task Put_Should_Return_OK_And_Confirm_Shopping_Cart()
-    {
+    public async Task Put_Should_Return_OK_And_Confirm_Shopping_Cart() =>
         await api
             .Given()
             .When(
@@ -52,7 +51,5 @@ public class ConfirmShoppingCartTests(ConfirmShoppingCartFixture api): IClassFix
                     details.ClientId.Should().Be(api.ClientId);
                     details.Version.Should().Be(1);
                 }));
-
-        // API.PublishedExternalEventsOfType<CartFinalized>();
-    }
+    // API.PublishedExternalEventsOfType<CartFinalized>();
 }

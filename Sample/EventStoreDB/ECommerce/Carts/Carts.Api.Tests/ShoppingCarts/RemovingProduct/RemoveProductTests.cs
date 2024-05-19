@@ -50,8 +50,7 @@ public class RemoveProductTests(RemoveProductFixture api): IClassFixture<RemoveP
 {
     [Fact]
     [Trait("Category", "Acceptance")]
-    public async Task Delete_Should_Return_OK_And_Cancel_Shopping_Cart()
-    {
+    public async Task Delete_Should_Return_OK_And_Cancel_Shopping_Cart() =>
         await api
             .Given()
             .When(
@@ -84,7 +83,6 @@ public class RemoveProductTests(RemoveProductFixture api): IClassFixture<RemoveP
                     details.ClientId.Should().Be(api.ClientId);
                     details.Version.Should().Be(2);
                 }));
-    }
 
     private readonly int RemovedCount = 5;
 }
