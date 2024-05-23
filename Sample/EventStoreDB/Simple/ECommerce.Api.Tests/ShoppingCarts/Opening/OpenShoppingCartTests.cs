@@ -8,11 +8,8 @@ using static Ogooreck.API.ApiSpecification;
 
 namespace ECommerce.Api.Tests.ShoppingCarts.Opening;
 
-public class OpenShoppingCartTests(ShoppingCartsApplicationFactory applicationFactory)
-    : IClassFixture<ShoppingCartsApplicationFactory>
+public class OpenShoppingCartTests(ApiFixture fixture): ApiTest(fixture)
 {
-    private readonly ApiSpecification<Program> API = ApiSpecification<Program>.Setup(applicationFactory);
-
     [Fact]
     public Task Post_ShouldReturn_CreatedStatus_With_CartId() =>
         API.Scenario(
@@ -25,8 +22,8 @@ public class OpenShoppingCartTests(ShoppingCartsApplicationFactory applicationFa
                 .Then(CREATED_WITH_DEFAULT_HEADERS(eTag: 0)),
             response =>
                 API.Given()
-                    .When(GET, URI($"/api/ShoppingCarts/{response.GetCreatedId()}"))
-                    .Until(RESPONSE_ETAG_IS(0))
+                    .When(GET, URI($"/api/ShoppingCarts/{response.GetCreatedId()}"), HEADERS(IF_MATCH(0)))
+                    .Until(RESPONSE_ETAG_IS(0), 10)
                     .Then(
                         OK,
                         RESPONSE_BODY<ShoppingCartDetails>(details =>

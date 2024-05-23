@@ -2,6 +2,8 @@ using Core.BackgroundWorkers;
 using Core.Configuration;
 using Core.Events;
 using Core.EventStoreDB.Subscriptions;
+using Core.EventStoreDB.Subscriptions.Batch;
+using Core.EventStoreDB.Subscriptions.Checkpoints;
 using Core.OpenTelemetry;
 using EventStore.Client;
 using Microsoft.Extensions.DependencyInjection;
@@ -42,23 +44,11 @@ public static class EventStoreDBConfigExtensions
         services
             .AddSingleton(EventTypeMapper.Instance)
             .AddSingleton(new EventStoreClient(EventStoreClientSettings.Create(eventStoreDBConfig.ConnectionString)))
-            .AddTransient<EventStoreDBSubscriptionToAll, EventStoreDBSubscriptionToAll>();
+            .AddScoped<EventsBatchProcessor, EventsBatchProcessor>()
+            .AddScoped<IEventsBatchCheckpointer, EventsBatchCheckpointer>()
+            .AddSingleton<ISubscriptionStoreSetup, NulloSubscriptionStoreSetup>();
 
         if (options?.UseInternalCheckpointing != false)
-        {
-            services
-                .AddTransient<ISubscriptionCheckpointRepository, EventStoreDBSubscriptionCheckpointRepository>();
-        }
-
-        return services;
-    }
-
-    public static IServiceCollection AddEventStoreDBSubscriptionToAll(
-        this IServiceCollection services,
-        EventStoreDBSubscriptionToAllOptions subscriptionOptions,
-        bool checkpointToEventStoreDB = true)
-    {
-        if (checkpointToEventStoreDB)
         {
             services
                 .AddTransient<ISubscriptionCheckpointRepository, EventStoreDBSubscriptionCheckpointRepository>();
@@ -69,16 +59,55 @@ public static class EventStoreDBConfigExtensions
                 var logger =
                     serviceProvider.GetRequiredService<ILogger<BackgroundWorker>>();
 
-                var eventStoreDBSubscriptionToAll =
-                    serviceProvider.GetRequiredService<EventStoreDBSubscriptionToAll>();
+                var coordinator = serviceProvider.GetRequiredService<EventStoreDBSubscriptionsToAllCoordinator>();
 
                 TelemetryPropagator.UseDefaultCompositeTextMapPropagator();
 
-                return new BackgroundWorker(
+                return new BackgroundWorker<EventStoreDBSubscriptionsToAllCoordinator>(
+                    coordinator,
                     logger,
-                    ct => eventStoreDBSubscriptionToAll.SubscribeToAll(subscriptionOptions, ct)
+                    (c, ct) => c.SubscribeToAll(ct)
                 );
             }
         );
+    }
+
+
+    public static IServiceCollection AddEventStoreDBSubscriptionToAll<THandler>(
+        this IServiceCollection services,
+        string subscriptionId
+    ) where THandler : IEventBatchHandler =>
+        services.AddEventStoreDBSubscriptionToAll(
+            new EventStoreDBSubscriptionToAllOptions { SubscriptionId = subscriptionId },
+            sp => [sp.GetRequiredService<THandler>()]
+        );
+
+
+    public static IServiceCollection AddEventStoreDBSubscriptionToAll<THandler>(
+        this IServiceCollection services,
+        EventStoreDBSubscriptionToAllOptions subscriptionOptions
+    ) where THandler : IEventBatchHandler =>
+        services.AddEventStoreDBSubscriptionToAll(subscriptionOptions, sp => [sp.GetRequiredService<THandler>()]);
+
+    public static IServiceCollection AddEventStoreDBSubscriptionToAll(
+        this IServiceCollection services,
+        EventStoreDBSubscriptionToAllOptions subscriptionOptions,
+        Func<IServiceProvider, IEventBatchHandler[]> handlers
+    )
+    {
+        services.AddSingleton<EventStoreDBSubscriptionsToAllCoordinator>();
+
+        return services.AddKeyedSingleton<EventStoreDBSubscriptionToAll>(
+            subscriptionOptions.SubscriptionId,
+            (sp, _) =>
+            {
+                var subscription = new EventStoreDBSubscriptionToAll(
+                    sp.GetRequiredService<EventStoreClient>(),
+                    sp.GetRequiredService<IServiceScopeFactory>(),
+                    sp.GetRequiredService<ILogger<EventStoreDBSubscriptionToAll>>()
+                ) { Options = subscriptionOptions, GetHandlers = handlers };
+
+                return subscription;
+            });
     }
 }

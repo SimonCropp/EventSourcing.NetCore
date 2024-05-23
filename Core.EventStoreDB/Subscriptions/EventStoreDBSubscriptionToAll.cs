@@ -1,13 +1,16 @@
-using System.Diagnostics;
 using Core.Events;
-using Core.EventStoreDB.Events;
-using Core.OpenTelemetry;
+using Core.EventStoreDB.Subscriptions.Batch;
+using Core.EventStoreDB.Subscriptions.Checkpoints;
+using Core.Extensions;
 using EventStore.Client;
 using Grpc.Core;
+using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Logging;
-using EventTypeFilter = EventStore.Client.EventTypeFilter;
+using Polly;
+using Polly.Wrap;
 
 namespace Core.EventStoreDB.Subscriptions;
+using static ISubscriptionCheckpointRepository;
 
 public class EventStoreDBSubscriptionToAllOptions
 {
@@ -20,140 +23,131 @@ public class EventStoreDBSubscriptionToAllOptions
     public UserCredentials? Credentials { get; set; }
     public bool ResolveLinkTos { get; set; }
     public bool IgnoreDeserializationErrors { get; set; } = true;
+
+    public int BatchSize { get; set; } = 1;
+    public int BatchDeadline { get; set; } = 50;
 }
 
 public class EventStoreDBSubscriptionToAll(
     EventStoreClient eventStoreClient,
-    EventTypeMapper eventTypeMapper,
-    IEventBus eventBus,
-    ISubscriptionCheckpointRepository checkpointRepository,
-    IActivityScope activityScope,
+    IServiceScopeFactory serviceScopeFactory,
     ILogger<EventStoreDBSubscriptionToAll> logger
 )
 {
-    private EventStoreDBSubscriptionToAllOptions subscriptionOptions = default!;
-    private string SubscriptionId => subscriptionOptions.SubscriptionId;
-
-    public async Task SubscribeToAll(EventStoreDBSubscriptionToAllOptions subscriptionOptions, CancellationToken ct)
+    public enum ProcessingStatus
     {
-        // see: https://github.com/dotnet/runtime/issues/36063
-        await Task.Yield();
+        NotStarted,
+        Starting,
+        Started,
+        Paused,
+        Errored,
+        Stopped
+    }
 
-        this.subscriptionOptions = subscriptionOptions;
+    public record EventBatch(string SubscriptionId, ResolvedEvent[] Events);
 
-        logger.LogInformation("Subscription to all '{SubscriptionId}'", subscriptionOptions.SubscriptionId);
+    public EventStoreDBSubscriptionToAllOptions Options { get; set; } = default!;
 
-        var checkpoint = await checkpointRepository.Load(SubscriptionId, ct).ConfigureAwait(false);
+    public Func<IServiceProvider, IEventBatchHandler[]> GetHandlers { get; set; } = default!;
 
+    public ProcessingStatus Status = ProcessingStatus.NotStarted;
+
+    private string SubscriptionId => Options.SubscriptionId;
+
+    public async Task SubscribeToAll(Checkpoint checkpoint, CancellationToken ct)
+    {
+        Status = ProcessingStatus.Starting;
+
+        logger.LogInformation("Subscription to all '{SubscriptionId}'", Options.SubscriptionId);
+
+        await RetryPolicy.ExecuteAsync(token =>
+                OnSubscribe(checkpoint, token), ct
+        ).ConfigureAwait(false);
+    }
+
+    private async Task OnSubscribe(Checkpoint checkpoint, CancellationToken ct)
+    {
         var subscription = eventStoreClient.SubscribeToAll(
-            checkpoint == null
-                ? FromAll.Start
-                : FromAll.After(new Position(checkpoint.Value, checkpoint.Value)),
-            subscriptionOptions.ResolveLinkTos,
-            subscriptionOptions.FilterOptions,
-            subscriptionOptions.Credentials,
+            checkpoint != Checkpoint.None ? FromAll.After(checkpoint) : FromAll.Start,
+            Options.ResolveLinkTos,
+            Options.FilterOptions,
+            Options.Credentials,
             ct
         );
 
+        Status = ProcessingStatus.Started;
+
         logger.LogInformation("Subscription to all '{SubscriptionId}' started", SubscriptionId);
 
-        try
+        await foreach(var events in subscription.Batch(Options.BatchSize, Options.BatchDeadline, ct))
         {
-            await foreach (var @event in subscription)
+            var batch = new EventBatch(Options.SubscriptionId, events.ToArray());
+            var result = await ProcessBatch(batch, checkpoint, ct).ConfigureAwait(false);
+
+            if (result is StoreResult.Success success)
             {
-                await HandleEvent(@event, ct).ConfigureAwait(false);
+                checkpoint = success.Checkpoint;
             }
-        }
-        catch (RpcException rpcException) when (rpcException is { StatusCode: StatusCode.Cancelled } ||
-                                                rpcException.InnerException is ObjectDisposedException)
-        {
-            logger.LogWarning(
-                "Subscription to all '{SubscriptionId}' dropped by client",
-                SubscriptionId
-            );
-        }
-        catch (Exception ex)
-        {
-            logger.LogWarning("Subscription was dropped: {Exception}", ex);
-
-            // Sleep between reconnections to not flood the database or not kill the CPU with infinite loop
-            // Randomness added to reduce the chance of multiple subscriptions trying to reconnect at the same time
-            Thread.Sleep(1000 + new Random((int)DateTime.UtcNow.Ticks).Next(1000));
-
-            await SubscribeToAll(this.subscriptionOptions, ct).ConfigureAwait(false);
         }
     }
 
-    private async Task HandleEvent(
-        ResolvedEvent resolvedEvent,
-        CancellationToken token
-    )
+    private async Task<StoreResult> ProcessBatch(EventBatch batch, Checkpoint lastCheckpoint, CancellationToken ct)
     {
         try
         {
-            if (IsEventWithEmptyData(resolvedEvent) || IsCheckpointEvent(resolvedEvent)) return;
+            await using var scope = serviceScopeFactory.CreateAsyncScope();
+            var checkpointer = scope.ServiceProvider.GetRequiredService<IEventsBatchCheckpointer>();
 
-            var eventEnvelope = resolvedEvent.ToEventEnvelope();
-
-            if (eventEnvelope == null)
-            {
-                // That can happen if we're sharing database between modules.
-                // If we're subscribing to all and not filtering out events from other modules,
-                // then we might get events that are from other module and we might not be able to deserialize them.
-                // In that case it's safe to ignore deserialization error.
-                // You may add more sophisticated logic checking if it should be ignored or not.
-                logger.LogWarning("Couldn't deserialize event with {EventType} and id: {EventId}",
-                    resolvedEvent.Event.EventType, resolvedEvent.Event.EventId);
-
-                if (!subscriptionOptions.IgnoreDeserializationErrors)
-                    throw new InvalidOperationException(
-                        $"Unable to deserialize event {resolvedEvent.Event.EventType} with id: {resolvedEvent.Event.EventId}"
-                    );
-
-                return;
-            }
-
-            await activityScope.Run($"{nameof(EventStoreDBSubscriptionToAll)}/{nameof(HandleEvent)}",
-                async (_, ct) =>
-                {
-                    // publish event to internal event bus
-                    await eventBus.Publish(eventEnvelope, ct).ConfigureAwait(false);
-
-                    await checkpointRepository.Store(SubscriptionId, resolvedEvent.Event.Position.CommitPosition, ct)
-                        .ConfigureAwait(false);
-                },
-                new StartActivityOptions
-                {
-                    Tags = { { TelemetryTags.EventHandling.Event, eventEnvelope.Data.GetType() } },
-                    Parent = eventEnvelope.Metadata.PropagationContext?.ActivityContext,
-                    Kind = ActivityKind.Consumer
-                },
-                token
+            return await checkpointer.Process(
+                batch.Events,
+                lastCheckpoint,
+                new BatchProcessingOptions(
+                    batch.SubscriptionId,
+                    Options.IgnoreDeserializationErrors,
+                    GetHandlers(scope.ServiceProvider)
+                ),
+                ct
             ).ConfigureAwait(false);
         }
-        catch (Exception e)
+        catch (Exception exc)
         {
-            logger.LogError("Error consuming message: {ExceptionMessage}{ExceptionStackTrace}", e.Message,
-                e.StackTrace);
-            // if you're fine with dropping some events instead of stopping subscription
-            // then you can add some logic if error should be ignored
+            // TODO: How would you implement Dead-Letter Queue here?
+            logger.LogError(exc, "Error while handling batch");
             throw;
         }
     }
 
-    private bool IsEventWithEmptyData(ResolvedEvent resolvedEvent)
+    private AsyncPolicyWrap RetryPolicy
     {
-        if (resolvedEvent.Event.Data.Length != 0) return false;
+        get
+        {
+            var generalPolicy = Policy.Handle<Exception>(ex => !IsCancelledByUser(ex))
+                .WaitAndRetryForeverAsync(
+                    sleepDurationProvider: _ =>
+                        TimeSpan.FromMilliseconds(1000 + new Random((int)DateTime.UtcNow.Ticks).Next(1000)),
+                    onRetry: (exception, _, _) =>
+                        logger.LogWarning("Subscription was dropped: {Exception}", exception)
+                );
 
-        logger.LogInformation("Event without data received");
-        return true;
+            var fallbackPolicy = Policy.Handle<OperationCanceledException>()
+                .Or<RpcException>(IsCancelledByUser)
+                .FallbackAsync(_ =>
+                    {
+                        logger.LogWarning("Subscription to all '{SubscriptionId}' dropped by client", SubscriptionId);
+                        return Task.CompletedTask;
+                    }
+                );
+
+            return Policy.WrapAsync(generalPolicy, fallbackPolicy);
+        }
     }
 
-    private bool IsCheckpointEvent(ResolvedEvent resolvedEvent)
-    {
-        if (resolvedEvent.Event.EventType != eventTypeMapper.ToName<CheckpointStored>()) return false;
+    private static bool IsCancelledByUser(RpcException rpcException) =>
+        rpcException.StatusCode == StatusCode.Cancelled
+        || rpcException.InnerException is ObjectDisposedException;
 
-        logger.LogInformation("Checkpoint event - ignoring");
-        return true;
-    }
+    private static bool IsCancelledByUser(Exception exception) =>
+        exception is OperationCanceledException
+        || exception is RpcException rpcException && IsCancelledByUser(rpcException);
+
 }

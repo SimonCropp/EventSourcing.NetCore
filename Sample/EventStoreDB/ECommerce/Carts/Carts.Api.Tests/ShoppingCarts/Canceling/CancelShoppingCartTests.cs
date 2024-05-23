@@ -8,14 +8,14 @@ using static Carts.Api.Tests.ShoppingCarts.ShoppingCartsApi;
 
 namespace Carts.Api.Tests.ShoppingCarts.Canceling;
 
-public class CancelShoppingCartTests(ApiSpecification<Program> api): IClassFixture<ApiSpecification<Program>>
+public class CancelShoppingCartTests(ApiFixture fixture): ApiTest(fixture)
 {
     public readonly Guid ClientId = Guid.NewGuid();
 
     [Fact]
     [Trait("Category", "Acceptance")]
     public Task Delete_Should_Return_OK_And_Cancel_Shopping_Cart() =>
-        api
+        API
             .Given("Opened Shopping Cart", OpenShoppingCart(ClientId))
             .When(
                 "Cancel Shopping Cart",
@@ -25,8 +25,8 @@ public class CancelShoppingCartTests(ApiSpecification<Program> api): IClassFixtu
             )
             .Then(OK)
             .And()
-            .When(GET, URI(ctx => $"/api/ShoppingCarts/{ctx.OpenedShoppingCartId()}"))
-            .Until(RESPONSE_ETAG_IS(1))
+            .When(GET, URI(ctx => $"/api/ShoppingCarts/{ctx.OpenedShoppingCartId()}"), HEADERS(IF_MATCH(1)))
+            .Until(RESPONSE_ETAG_IS(1), 10)
             .Then(
                 OK,
                 RESPONSE_BODY<ShoppingCartDetails>((details, ctx) =>

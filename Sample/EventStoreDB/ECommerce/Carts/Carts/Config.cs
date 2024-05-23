@@ -1,5 +1,6 @@
 using Carts.ShoppingCarts;
 using Core.EventStoreDB;
+using Core.EventStoreDB.Subscriptions.Checkpoints.Postgres;
 using Core.Marten;
 using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.DependencyInjection;
@@ -11,7 +12,7 @@ public static class Config
     public static IServiceCollection AddCartsModule(this IServiceCollection services, IConfiguration config) =>
         services
             // Document Part used for projections
-            .AddMarten(config, configKey: "ReadModel_Marten")
+            .AddMarten(config, configKey: "ReadModel_Marten", disableAsyncDaemon: true)
             .Services
             .AddCarts()
             .AddEventStoreDB(config);

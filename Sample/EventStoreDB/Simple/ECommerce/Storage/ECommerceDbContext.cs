@@ -4,7 +4,7 @@ using Microsoft.EntityFrameworkCore.Design;
 
 namespace ECommerce.Storage;
 
-public class ECommerceDbContext(DbContextOptions<ECommerceDbContext> options): DbContext(options)
+public class ECommerceDbContext(DbContextOptions<ECommerceDbContext> options): DbContext(options), IDisposable, IAsyncDisposable
 {
     protected override void OnModelCreating(ModelBuilder modelBuilder)
     {
